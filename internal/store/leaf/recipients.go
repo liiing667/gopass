@@ -23,6 +23,24 @@ const (
 	oldKeyDir = ".gpg-keys"
 )
 
+// isSafeRecipientID reports whether a recipient ID is safe to use as a file
+// name inside the .public-keys/ or legacy .gpg-keys/ directories. Legitimate
+// IDs are email addresses, short key IDs or full fingerprints — none of them
+// contain path separators or dot segments. Anything else (e.g. "../foo",
+// "a/b" or `a\b`) is rejected so that a maliciously crafted .gpg-id file
+// from a shared repository cannot make gopass read, write or delete files
+// outside the key directories.
+func isSafeRecipientID(id string) bool {
+	if id == "" || id == "." || id == ".." {
+		return false
+	}
+	if strings.ContainsAny(id, `/\`) {
+		return false
+	}
+
+	return !strings.ContainsRune(id, 0)
+}
+
 // ErrInvalidHash indicates an outdated value of `recipients.hash`.
 var ErrInvalidHash = fmt.Errorf("recipients.hash invalid")
 
@@ -586,6 +604,23 @@ RECIPIENTS:
 	// Only delete the .public-keys/ and legacy .gpg-keys/ files for the
 	// explicitly removed recipient. This replaces the old blanket
 	// removeExtraKeys which could delete unrelated key files.
+	//
+	// Validate all removed IDs before deleting anything: a single unsafe
+	// ID (e.g. "../foo" from a malicious .gpg-id) must not cause other
+	// key files to be deleted first.
+	unsafe := make([]string, 0, len(removedIDs))
+	for _, id := range removedIDs {
+		if !isSafeRecipientID(id) {
+			unsafe = append(unsafe, id)
+		}
+	}
+
+	if len(unsafe) > 0 {
+		out.Errorf(ctx, "Refusing to clean up key files for unsafe recipient IDs: %s", strings.Join(unsafe, ", "))
+
+		return s.reencrypt(ctxutil.WithCommitMessage(ctx, "Remove Recipient "+key))
+	}
+
 	for _, id := range removedIDs {
 		pubKeyPath := filepath.Join(keyDir, id)
 		if s.storage.Exists(ctx, pubKeyPath) {
@@ -661,6 +696,18 @@ func (s *Store) getRecipients(ctx context.Context, idf string) (*recipients.Reci
 	}
 
 	rs := recipients.Unmarshal(buf)
+
+	// Never propagate recipient IDs that would be unsafe as file names
+	// inside .public-keys/ or .gpg-keys/. A shared repository can contain
+	// a malicious .gpg-id (e.g. "../foo") that would otherwise make the
+	// diagnostic, export and removal paths operate on files outside the
+	// key directories.
+	for _, id := range rs.IDs() {
+		if !isSafeRecipientID(id) {
+			out.Warningf(ctx, "Ignoring unsafe recipient ID %q from %s: must not contain path separators or dot segments", id, idf)
+			rs.Remove(id)
+		}
+	}
 
 	cfg, _ := config.FromContext(ctx)
 	// check recipients hash, global config takes precedence here for security reasons

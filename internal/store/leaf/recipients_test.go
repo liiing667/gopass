@@ -806,3 +806,119 @@ func TestDiagnoseRecipientsPubkeyOnly(t *testing.T) {
 	}
 	assert.True(t, found, "A3683834 should be reported as .public-keys/ only warning")
 }
+
+// TestIsSafeRecipientID verifies that legitimate recipient IDs (emails,
+// short key IDs, full fingerprints) are accepted while path traversal
+// sequences and separators are rejected.
+func TestIsSafeRecipientID(t *testing.T) {
+	t.Parallel()
+
+	safe := []string{
+		"john.doe@example.com",
+		"0xDEADBEEF",
+		"DEADBEEF",
+		"0xFEEDBEEF0xDEADBEEF",
+		"9B1B0C9F0E5D1C0B0A0908070605040302010000FF",
+		"john.doe+spam@example.co.uk",
+	}
+	for _, id := range safe {
+		assert.True(t, isSafeRecipientID(id), "expected %q to be accepted", id)
+	}
+
+	unsafe := []string{
+		"",
+		".",
+		"..",
+		"../evil",
+		"../../etc/passwd",
+		"foo/bar",
+		`foo\bar`,
+		`..\evil`,
+		".public-keys/0xDEADBEEF",
+	}
+	for _, id := range unsafe {
+		assert.False(t, isSafeRecipientID(id), "expected %q to be rejected", id)
+	}
+}
+
+// TestGetRecipientsFiltersUnsafeIDs verifies that unsafe recipient IDs
+// loaded from a (potentially malicious) shared .gpg-id file are dropped
+// at the parsing entry point while legitimate IDs are kept.
+func TestGetRecipientsFiltersUnsafeIDs(t *testing.T) {
+	t.Parallel()
+
+	ctx := config.NewContextInMemory()
+
+	tempdir := t.TempDir()
+
+	_, _, err := createStore(tempdir, []string{
+		"0xDEADBEEF",
+		"john.doe@example.com",
+		"../evil",
+		"foo/bar",
+		`foo\bar`,
+		"..",
+	}, nil)
+	require.NoError(t, err)
+
+	ctx, _, _ = captureOutput(t, ctx)
+
+	s := &Store{
+		alias:   "",
+		path:    tempdir,
+		crypto:  plain.New(),
+		storage: fs.New(tempdir),
+	}
+
+	rs, err := s.GetRecipients(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"0xDEADBEEF", "john.doe@example.com"}, rs.IDs())
+}
+
+// TestRemoveRecipientUnsafeID verifies that a malicious recipient ID in a
+// shared .gpg-id cannot be used to delete files outside the key directories
+// and that removing a legitimate recipient does not touch any other files.
+func TestRemoveRecipientUnsafeID(t *testing.T) {
+	t.Parallel()
+
+	ctx := config.NewContextInMemory()
+	ctx = ctxutil.WithHidden(ctx, true)
+	ctx = config.NewInMemory().WithConfig(ctx)
+
+	tempdir := t.TempDir()
+
+	_, _, err := createStore(tempdir, []string{"0xDEADBEEF", "0xFEEDBEEF", "../evil"}, nil)
+	require.NoError(t, err)
+
+	ctx, _, _ = captureOutput(t, ctx)
+
+	s := &Store{
+		alias:   "",
+		path:    tempdir,
+		crypto:  plain.New(),
+		storage: fs.New(tempdir),
+	}
+
+	// The traversal target: .public-keys/../evil resolves outside the
+	// key directory.
+	outside := filepath.Join(tempdir, "evil")
+	require.NoError(t, os.WriteFile(outside, []byte("do-not-touch"), 0o600))
+
+	// Legitimate exported keys for the real recipients.
+	require.NoError(t, s.storage.Set(ctx, filepath.Join(".public-keys", "0xDEADBEEF"), []byte("dead-key")))
+	require.NoError(t, s.storage.Set(ctx, filepath.Join(".public-keys", "0xFEEDBEEF"), []byte("feed-key")))
+
+	// The unsafe ID is filtered at parse time, so it cannot be removed
+	// and no file may be deleted.
+	require.Error(t, s.RemoveRecipient(ctx, "../evil"))
+	assert.FileExists(t, outside, "file outside the key directory must not be deleted")
+	assert.True(t, s.storage.Exists(ctx, filepath.Join(".public-keys", "0xDEADBEEF")),
+		"other recipients' key files must not be deleted")
+
+	// Removing the legitimate recipient only removes its own key file.
+	require.NoError(t, s.RemoveRecipient(ctx, "0xDEADBEEF"))
+	assert.False(t, s.storage.Exists(ctx, filepath.Join(".public-keys", "0xDEADBEEF")))
+	assert.True(t, s.storage.Exists(ctx, filepath.Join(".public-keys", "0xFEEDBEEF")),
+		"other recipients' key files must not be deleted")
+	assert.FileExists(t, outside, "file outside the key directory must not be deleted")
+}

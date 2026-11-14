@@ -162,6 +162,10 @@ func (s *Store) ImportMissingPublicKeys(ctx context.Context, newrs ...string) er
 }
 
 func (s *Store) decodePublicKey(ctx context.Context, r string) ([]string, error) {
+	if !isSafeRecipientID(r) {
+		return nil, fmt.Errorf("refusing to decode public key for unsafe recipient ID %q", r)
+	}
+
 	for _, kd := range []string{keyDir, oldKeyDir} {
 		filename := filepath.Join(kd, r)
 		if !s.storage.Exists(ctx, filename) {
@@ -182,6 +186,10 @@ func (s *Store) decodePublicKey(ctx context.Context, r string) ([]string, error)
 
 // export an ASCII armored public key.
 func (s *Store) exportPublicKey(ctx context.Context, exp keyExporter, r string) (string, error) {
+	if !isSafeRecipientID(r) {
+		return "", fmt.Errorf("refusing to export public key for unsafe recipient ID %q", r)
+	}
+
 	filename := filepath.Join(keyDir, r)
 
 	// do not overwrite existing keys, unless forced
@@ -221,6 +229,10 @@ type keyExporter interface {
 }
 
 func (s *Store) getPublicKey(ctx context.Context, r string) ([]byte, error) {
+	if !isSafeRecipientID(r) {
+		return nil, fmt.Errorf("refusing to read public key for unsafe recipient ID %q", r)
+	}
+
 	for _, kd := range []string{keyDir, oldKeyDir} {
 		filename := filepath.Join(kd, r)
 		if !s.storage.Exists(ctx, filename) {
